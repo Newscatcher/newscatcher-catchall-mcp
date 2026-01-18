@@ -40,6 +40,7 @@ client = httpx.AsyncClient(
     base_url=API_BASE_URL,
     timeout=60.0,
     event_hooks={"request": [inject_api_key]},
+    headers={"Accept-Encoding": "identity"},  # Request uncompressed responses
 )
 
 # Load the OpenAPI specification
