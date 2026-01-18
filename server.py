@@ -1,6 +1,7 @@
 import contextvars
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.dependencies import get_http_request
 
 # API configuration
@@ -11,13 +12,19 @@ OPENAPI_SPEC_URL = f"{API_BASE_URL}/openapi.json"
 current_api_key: contextvars.ContextVar[str] = contextvars.ContextVar("current_api_key", default="")
 
 
-def get_api_key_from_request() -> str:
-    """Extract API key from the current request's query parameters."""
-    try:
-        request = get_http_request()
-        return request.query_params.get("apiKey", "")
-    except Exception:
-        return current_api_key.get("")
+class ApiKeyMiddleware(Middleware):
+    """Middleware to extract API key from query parameters before each tool call."""
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        """Extract API key from HTTP request query params before tool execution."""
+        try:
+            request = get_http_request()
+            api_key = request.query_params.get("apiKey", "")
+            if api_key:
+                current_api_key.set(api_key)
+        except Exception:
+            pass
+        return await call_next(context)
 
 
 async def inject_api_key(request: httpx.Request) -> httpx.Request:
@@ -95,34 +102,8 @@ mcp = FastMCP.from_openapi(
     name="Newscatcher CatchAll API",
 )
 
-
-@mcp.tool
-async def set_api_key() -> str:
-    """Initialize the API key from the connection URL query parameter.
-
-    This tool is called automatically when needed. Users should pass their
-    CatchAll API key in the connection URL: ?apiKey=YOUR_API_KEY
-    """
-    api_key = get_api_key_from_request()
-    if api_key:
-        current_api_key.set(api_key)
-        return "API key configured successfully"
-    return "No API key found in query parameters. Please add ?apiKey=YOUR_API_KEY to the connection URL."
-
-
-# Override the tool call to inject API key before each call
-original_call_tool = mcp.call_tool
-
-
-async def call_tool_with_api_key(name: str, arguments: dict):
-    """Wrapper to inject API key before each tool call."""
-    api_key = get_api_key_from_request()
-    if api_key:
-        current_api_key.set(api_key)
-    return await original_call_tool(name, arguments)
-
-
-mcp.call_tool = call_tool_with_api_key
+# Add middleware to extract API key from query parameters
+mcp.add_middleware(ApiKeyMiddleware())
 
 if __name__ == "__main__":
     mcp.run()
