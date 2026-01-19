@@ -7,59 +7,73 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.dependencies import get_http_request
 
 
-class DecompressingTransport(httpx.AsyncHTTPTransport):
-    """Custom transport that ensures response content is properly decompressed.
+def decompress_content(content: bytes, encoding: str) -> bytes:
+    """Decompress content based on encoding type."""
+    encoding = encoding.lower()
+    if encoding == "gzip":
+        return gzip.decompress(content)
+    elif encoding == "deflate":
+        try:
+            return zlib.decompress(content)
+        except zlib.error:
+            # Try raw deflate (without zlib header)
+            return zlib.decompress(content, -zlib.MAX_WBITS)
+    elif encoding == "br":
+        try:
+            import brotli
+            return brotli.decompress(content)
+        except ImportError:
+            return content
+    return content
 
-    This handles cases where the server returns compressed content even when
-    Accept-Encoding: identity is requested, or when automatic decompression fails.
+
+class DecompressingAsyncClient(httpx.AsyncClient):
+    """AsyncClient wrapper that ensures response content is decompressed.
+
+    This fixes UTF-8 encoding errors when servers return compressed content
+    that isn't automatically decompressed by httpx.
     """
 
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        response = await super().handle_async_request(request)
+    async def send(self, request: httpx.Request, **kwargs) -> httpx.Response:
+        response = await super().send(request, **kwargs)
 
-        # Check if we need to manually decompress
+        # Check if content appears compressed but wasn't decompressed
         content_encoding = response.headers.get("content-encoding", "").lower()
-        if content_encoding in ("gzip", "deflate", "br"):
+
+        if content_encoding and content_encoding != "identity":
             try:
-                # Read the raw content
-                raw_content = response.content
-
-                # Decompress based on encoding
-                if content_encoding == "gzip":
-                    decompressed = gzip.decompress(raw_content)
-                elif content_encoding == "deflate":
-                    try:
-                        decompressed = zlib.decompress(raw_content)
-                    except zlib.error:
-                        # Try raw deflate (without zlib header)
-                        decompressed = zlib.decompress(raw_content, -zlib.MAX_WBITS)
-                elif content_encoding == "br":
-                    try:
-                        import brotli
-                        decompressed = brotli.decompress(raw_content)
-                    except ImportError:
-                        decompressed = raw_content
+                # Read raw content - use _content if available (already read)
+                if hasattr(response, '_content') and response._content is not None:
+                    raw_content = response._content
                 else:
-                    decompressed = raw_content
+                    raw_content = await response.aread()
 
-                # Create a new response with decompressed content
-                # Remove the content-encoding header since we've decompressed
-                new_headers = httpx.Headers(
-                    [(k, v) for k, v in response.headers.items()
-                     if k.lower() != "content-encoding"]
-                )
+                # Check if content looks like compressed data (not valid UTF-8 JSON)
+                try:
+                    raw_content.decode('utf-8')
+                    # If it decodes fine, it's already decompressed
+                except UnicodeDecodeError:
+                    # Needs decompression
+                    decompressed = decompress_content(raw_content, content_encoding)
 
-                return httpx.Response(
-                    status_code=response.status_code,
-                    headers=new_headers,
-                    content=decompressed,
-                    request=request,
-                )
+                    # Create new headers without content-encoding
+                    new_headers = httpx.Headers([
+                        (k, v) for k, v in response.headers.raw
+                        if k.lower() != b"content-encoding"
+                    ])
+
+                    # Return new response with decompressed content
+                    return httpx.Response(
+                        status_code=response.status_code,
+                        headers=new_headers,
+                        content=decompressed,
+                        request=request,
+                    )
             except Exception:
-                # If decompression fails, return original response
                 pass
 
         return response
+
 
 # API configuration
 API_BASE_URL = "https://catchall.newscatcherapi.com"
@@ -114,11 +128,10 @@ async def inject_api_key(request: httpx.Request) -> httpx.Request:
     return request
 
 
-# Create an HTTP client with dynamic API key injection and custom decompression
-client = httpx.AsyncClient(
+# Create an HTTP client with decompression handling
+client = DecompressingAsyncClient(
     base_url=API_BASE_URL,
     timeout=60.0,
-    transport=DecompressingTransport(),
     event_hooks={"request": [inject_api_key]},
 )
 
