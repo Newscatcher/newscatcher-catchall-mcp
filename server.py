@@ -13,13 +13,35 @@ current_api_key: contextvars.ContextVar[str] = contextvars.ContextVar("current_a
 
 
 class ApiKeyMiddleware(Middleware):
-    """Middleware to extract API key from query parameters before each tool call."""
+    """Middleware to extract API key from query parameters or headers before each tool call."""
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        """Extract API key from HTTP request query params before tool execution."""
+        """Extract API key from HTTP request query params or headers before tool execution.
+
+        Supported methods:
+        - URL query parameter: ?apiKey=YOUR_KEY
+        - Header: x-api-key: YOUR_KEY
+        - Header: Authorization: Bearer YOUR_KEY
+
+        Headers take precedence over query parameters.
+        """
         try:
             request = get_http_request()
+            api_key = ""
+
+            # First check query parameters
             api_key = request.query_params.get("apiKey", "")
+
+            # Headers take precedence over query params
+            # Check x-api-key header
+            if request.headers.get("x-api-key"):
+                api_key = request.headers.get("x-api-key")
+            # Check Authorization header (Bearer token)
+            elif request.headers.get("authorization"):
+                auth_header = request.headers.get("authorization", "")
+                if auth_header.lower().startswith("bearer "):
+                    api_key = auth_header[7:]  # Remove "Bearer " prefix
+
             if api_key:
                 current_api_key.set(api_key)
         except Exception:
