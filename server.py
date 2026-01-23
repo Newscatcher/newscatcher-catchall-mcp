@@ -2,10 +2,13 @@
 MCP Server for Newscatcher CatchAll API
 
 This server provides tools to interact with the Newscatcher CatchAll API.
-Users must provide their own API key with each request.
+Users can provide their API key via:
+1. The api_key parameter in each tool call
+2. The NEWSCATCHER_API_KEY environment variable
 """
 
 import json
+import os
 from typing import Any
 
 import httpx
@@ -21,13 +24,26 @@ mcp = FastMCP(
 
 IMPORTANT: You need a Newscatcher API key to use these tools. Get one at https://www.newscatcherapi.com/
 
+The API key can be provided in two ways:
+1. Pass it directly in the api_key parameter (takes precedence)
+2. Set the NEWSCATCHER_API_KEY environment variable
+
 Workflow:
 1. Use submit_query to submit your news search query
 2. Use get_job_status to check if processing is complete
-3. Use pull_results to retrieve the clustered news articles
-
-Always pass your api_key with each tool call.""",
+3. Use pull_results to retrieve the clustered news articles""",
 )
+
+
+def get_api_key(api_key: str = "") -> str:
+    """Get API key from parameter or environment variable."""
+    key = api_key or os.environ.get("NEWSCATCHER_API_KEY", "")
+    if not key:
+        raise ValueError(
+            "API key is required. Either pass it as the api_key parameter "
+            "or set the NEWSCATCHER_API_KEY environment variable."
+        )
+    return key
 
 
 async def make_api_request(
@@ -38,11 +54,10 @@ async def make_api_request(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Make an API request to Newscatcher CatchAll API."""
-    if not api_key:
-        raise ValueError("API key is required. Please provide your Newscatcher API key.")
+    key = get_api_key(api_key)
 
     headers = {
-        "x-api-key": api_key,
+        "x-api-key": key,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -79,7 +94,7 @@ async def make_api_request(
 
 
 @mcp.tool()
-async def submit_query(api_key: str, query: str) -> str:
+async def submit_query(query: str, api_key: str = "") -> str:
     """
     Submit a natural language query to search for news articles.
 
@@ -87,8 +102,8 @@ async def submit_query(api_key: str, query: str) -> str:
     Returns a job_id that you'll use to check status and retrieve results.
 
     Args:
-        api_key: Your Newscatcher API key (get one at https://www.newscatcherapi.com/)
         query: Natural language query to search for news (e.g., 'Find all M&A deals in tech sector last 7 days')
+        api_key: Your Newscatcher API key. Optional if NEWSCATCHER_API_KEY env var is set.
 
     Returns:
         JSON with job_id to use for checking status and getting results
@@ -108,7 +123,7 @@ async def submit_query(api_key: str, query: str) -> str:
 
 
 @mcp.tool()
-async def get_job_status(api_key: str, job_id: str) -> str:
+async def get_job_status(job_id: str, api_key: str = "") -> str:
     """
     Check the status of a submitted job.
 
@@ -116,8 +131,8 @@ async def get_job_status(api_key: str, job_id: str) -> str:
     Status progression: submitted -> analyzing -> fetching -> clustering -> enriching -> completed
 
     Args:
-        api_key: Your Newscatcher API key
         job_id: The job ID returned from submit_query
+        api_key: Your Newscatcher API key. Optional if NEWSCATCHER_API_KEY env var is set.
 
     Returns:
         JSON with current job status and progress information
@@ -136,7 +151,7 @@ async def get_job_status(api_key: str, job_id: str) -> str:
 
 
 @mcp.tool()
-async def pull_results(api_key: str, job_id: str, page: int = 1, page_size: int = 100) -> str:
+async def pull_results(job_id: str, api_key: str = "", page: int = 1, page_size: int = 100) -> str:
     """
     Retrieve the results of a completed job.
 
@@ -144,8 +159,8 @@ async def pull_results(api_key: str, job_id: str, page: int = 1, page_size: int 
     Returns clustered and summarized news articles.
 
     Args:
-        api_key: Your Newscatcher API key
         job_id: The job ID returned from submit_query
+        api_key: Your Newscatcher API key. Optional if NEWSCATCHER_API_KEY env var is set.
         page: Page number for pagination (default: 1)
         page_size: Number of results per page (default: 100, max: 100)
 
@@ -167,14 +182,14 @@ async def pull_results(api_key: str, job_id: str, page: int = 1, page_size: int 
 
 
 @mcp.tool()
-async def list_user_jobs(api_key: str) -> str:
+async def list_user_jobs(api_key: str = "") -> str:
     """
     List all jobs submitted by you.
 
     Returns your job history with IDs, queries, statuses, and timestamps.
 
     Args:
-        api_key: Your Newscatcher API key
+        api_key: Your Newscatcher API key. Optional if NEWSCATCHER_API_KEY env var is set.
 
     Returns:
         JSON with list of your submitted jobs
@@ -193,15 +208,15 @@ async def list_user_jobs(api_key: str) -> str:
 
 
 @mcp.tool()
-async def continue_job(api_key: str, job_id: str) -> str:
+async def continue_job(job_id: str, api_key: str = "") -> str:
     """
     Continue processing a job that needs more data.
 
     Use this when a job requires additional article fetching.
 
     Args:
-        api_key: Your Newscatcher API key
         job_id: The job ID to continue processing
+        api_key: Your Newscatcher API key. Optional if NEWSCATCHER_API_KEY env var is set.
 
     Returns:
         JSON confirming the job continuation
