@@ -1,202 +1,224 @@
-import contextvars
-import gzip
-import zlib
+"""
+MCP Server for Newscatcher CatchAll API
+
+This server provides tools to interact with the Newscatcher CatchAll API.
+Users must provide their own API key with each request.
+"""
+
+import json
+from typing import Any
+
 import httpx
 from fastmcp import FastMCP
-from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.server.dependencies import get_http_request
 
-
-def decompress_content(content: bytes, encoding: str) -> bytes:
-    """Decompress content based on encoding type."""
-    encoding = encoding.lower()
-    if encoding == "gzip":
-        return gzip.decompress(content)
-    elif encoding == "deflate":
-        try:
-            return zlib.decompress(content)
-        except zlib.error:
-            # Try raw deflate (without zlib header)
-            return zlib.decompress(content, -zlib.MAX_WBITS)
-    elif encoding == "br":
-        try:
-            import brotli
-            return brotli.decompress(content)
-        except ImportError:
-            return content
-    return content
-
-
-class DecompressingAsyncClient(httpx.AsyncClient):
-    """AsyncClient wrapper that ensures response content is decompressed.
-
-    This fixes UTF-8 encoding errors when servers return compressed content
-    that isn't automatically decompressed by httpx.
-    """
-
-    async def send(self, request: httpx.Request, **kwargs) -> httpx.Response:
-        response = await super().send(request, **kwargs)
-
-        # Check if content appears compressed but wasn't decompressed
-        content_encoding = response.headers.get("content-encoding", "").lower()
-
-        if content_encoding and content_encoding != "identity":
-            try:
-                # Read raw content - use _content if available (already read)
-                if hasattr(response, '_content') and response._content is not None:
-                    raw_content = response._content
-                else:
-                    raw_content = await response.aread()
-
-                # Check if content looks like compressed data (not valid UTF-8 JSON)
-                try:
-                    raw_content.decode('utf-8')
-                    # If it decodes fine, it's already decompressed
-                except UnicodeDecodeError:
-                    # Needs decompression
-                    decompressed = decompress_content(raw_content, content_encoding)
-
-                    # Create new headers without content-encoding
-                    new_headers = httpx.Headers([
-                        (k, v) for k, v in response.headers.raw
-                        if k.lower() != b"content-encoding"
-                    ])
-
-                    # Return new response with decompressed content
-                    return httpx.Response(
-                        status_code=response.status_code,
-                        headers=new_headers,
-                        content=decompressed,
-                        request=request,
-                    )
-            except Exception:
-                pass
-
-        return response
-
-
-# API configuration
+# API Configuration
 API_BASE_URL = "https://catchall.newscatcherapi.com"
-OPENAPI_SPEC_URL = f"{API_BASE_URL}/openapi.json"
 
-# Context variable to store the API key for the current request
-current_api_key: contextvars.ContextVar[str] = contextvars.ContextVar("current_api_key", default="")
+# Create the FastMCP server
+mcp = FastMCP(
+    "Newscatcher CatchAll API",
+    instructions="""This server allows you to search for news articles using natural language queries via the Newscatcher CatchAll API.
 
+IMPORTANT: You need a Newscatcher API key to use these tools. Get one at https://www.newscatcherapi.com/
 
-class ApiKeyMiddleware(Middleware):
-    """Middleware to extract API key from query parameters or headers before each tool call."""
+Workflow:
+1. Use submit_query to submit your news search query
+2. Use get_job_status to check if processing is complete
+3. Use pull_results to retrieve the clustered news articles
 
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
-        """Extract API key from HTTP request query params or headers before tool execution.
-
-        Supported methods:
-        - URL query parameter: ?apiKey=YOUR_KEY
-        - Header: x-api-key: YOUR_KEY
-        - Header: Authorization: Bearer YOUR_KEY
-
-        Headers take precedence over query parameters.
-        """
-        try:
-            request = get_http_request()
-            api_key = ""
-
-            # First check query parameters
-            api_key = request.query_params.get("apiKey", "")
-
-            # Headers take precedence over query params
-            # Check x-api-key header
-            if request.headers.get("x-api-key"):
-                api_key = request.headers.get("x-api-key")
-            # Check Authorization header (Bearer token)
-            elif request.headers.get("authorization"):
-                auth_header = request.headers.get("authorization", "")
-                if auth_header.lower().startswith("bearer "):
-                    api_key = auth_header[7:]  # Remove "Bearer " prefix
-
-            if api_key:
-                current_api_key.set(api_key)
-        except Exception:
-            pass
-        return await call_next(context)
-
-
-async def inject_api_key(request: httpx.Request) -> httpx.Request:
-    """Event hook to inject the API key header into outgoing requests."""
-    api_key = current_api_key.get("")
-    if api_key:
-        request.headers["x-api-key"] = api_key
-    return request
-
-
-# Create an HTTP client with decompression handling
-client = DecompressingAsyncClient(
-    base_url=API_BASE_URL,
-    timeout=60.0,
-    event_hooks={"request": [inject_api_key]},
+Always pass your api_key with each tool call.""",
 )
 
-# Load the OpenAPI specification
-openapi_spec = httpx.get(OPENAPI_SPEC_URL).json()
+
+async def make_api_request(
+    api_key: str,
+    method: str,
+    path: str,
+    json_data: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Make an API request to Newscatcher CatchAll API."""
+    if not api_key:
+        raise ValueError("API key is required. Please provide your Newscatcher API key.")
+
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(base_url=API_BASE_URL, timeout=60.0) as client:
+        response = await client.request(
+            method=method,
+            url=path,
+            headers=headers,
+            json=json_data,
+            params=params,
+        )
+
+        if response.status_code >= 400:
+            try:
+                error_data = response.json()
+                if isinstance(error_data, dict):
+                    if "detail" in error_data:
+                        detail = error_data["detail"]
+                        if isinstance(detail, dict) and "detail" in detail:
+                            error_msg = detail["detail"]
+                        else:
+                            error_msg = str(detail)
+                    else:
+                        error_msg = json.dumps(error_data)
+                else:
+                    error_msg = str(error_data)
+            except Exception:
+                error_msg = response.text or f"HTTP {response.status_code}"
+
+            raise ValueError(f"API Error ({response.status_code}): {error_msg}")
+
+        return response.json()
 
 
-def fix_openapi_spec(spec: dict) -> dict:
-    """Fix OpenAPI spec compatibility issues for FastMCP's legacy parser.
-
-    The WebhookDTO schema has issues that the legacy parser can't handle:
-    1. Tuple-style 'auth' field using OpenAPI 3.1 prefixItems syntax
-    2. 'url' field using anyOf with multiple string types
-
-    This normalizes these fields to simpler types.
+@mcp.tool()
+async def submit_query(api_key: str, query: str) -> str:
     """
-    schemas = spec.get("components", {}).get("schemas", {})
+    Submit a natural language query to search for news articles.
 
-    if "WebhookDTO" in schemas:
-        webhook_dto = schemas["WebhookDTO"]
-        properties = webhook_dto.get("properties", {})
+    The system will fetch, validate, cluster, and summarize relevant articles.
+    Returns a job_id that you'll use to check status and retrieve results.
 
-        # Fix auth field - convert tuple-style array to simple string array
-        if "auth" in properties:
-            auth_field = properties["auth"]
-            if isinstance(auth_field.get("items"), list):
-                properties["auth"] = {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                    "title": auth_field.get("title", "Auth"),
-                    "description": auth_field.get(
-                        "description", "Basic auth credentials [username, password]"
-                    ),
-                }
+    Args:
+        api_key: Your Newscatcher API key (get one at https://www.newscatcherapi.com/)
+        query: Natural language query to search for news (e.g., 'Find all M&A deals in tech sector last 7 days')
 
-        # Fix url field - simplify anyOf to simple string with uri format
-        if "url" in properties:
-            url_field = properties["url"]
-            if "anyOf" in url_field:
-                properties["url"] = {
-                    "type": "string",
-                    "format": "uri",
-                    "title": url_field.get("title", "Url"),
-                    "description": url_field.get(
-                        "description", "The URL where the request will be sent"
-                    ),
-                }
-
-    return spec
+    Returns:
+        JSON with job_id to use for checking status and getting results
+    """
+    try:
+        result = await make_api_request(
+            api_key=api_key,
+            method="POST",
+            path="/catchAll/submit",
+            json_data={"query": query},
+        )
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return f"Error: {str(e)}"
+    except Exception as e:
+        return f"Unexpected error: {str(e)}"
 
 
-# Fix compatibility issues in the OpenAPI spec
-openapi_spec = fix_openapi_spec(openapi_spec)
+@mcp.tool()
+async def get_job_status(api_key: str, job_id: str) -> str:
+    """
+    Check the status of a submitted job.
 
-# Create the MCP server from OpenAPI spec
-mcp = FastMCP.from_openapi(
-    openapi_spec=openapi_spec,
-    client=client,
-    name="Newscatcher CatchAll API",
-)
+    Call this after submit_query to see if your job is ready.
+    Status progression: submitted -> analyzing -> fetching -> clustering -> enriching -> completed
 
-# Add middleware to extract API key from query parameters
-mcp.add_middleware(ApiKeyMiddleware())
+    Args:
+        api_key: Your Newscatcher API key
+        job_id: The job ID returned from submit_query
+
+    Returns:
+        JSON with current job status and progress information
+    """
+    try:
+        result = await make_api_request(
+            api_key=api_key,
+            method="GET",
+            path=f"/catchAll/status/{job_id}",
+        )
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return f"Error: {str(e)}"
+    except Exception as e:
+        return f"Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def pull_results(api_key: str, job_id: str, page: int = 1, page_size: int = 100) -> str:
+    """
+    Retrieve the results of a completed job.
+
+    Only call this after get_job_status shows the job is complete.
+    Returns clustered and summarized news articles.
+
+    Args:
+        api_key: Your Newscatcher API key
+        job_id: The job ID returned from submit_query
+        page: Page number for pagination (default: 1)
+        page_size: Number of results per page (default: 100, max: 100)
+
+    Returns:
+        JSON with clustered news articles, summaries, and metadata
+    """
+    try:
+        result = await make_api_request(
+            api_key=api_key,
+            method="GET",
+            path=f"/catchAll/pull/{job_id}",
+            params={"page": page, "page_size": page_size},
+        )
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return f"Error: {str(e)}"
+    except Exception as e:
+        return f"Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def list_user_jobs(api_key: str) -> str:
+    """
+    List all jobs submitted by you.
+
+    Returns your job history with IDs, queries, statuses, and timestamps.
+
+    Args:
+        api_key: Your Newscatcher API key
+
+    Returns:
+        JSON with list of your submitted jobs
+    """
+    try:
+        result = await make_api_request(
+            api_key=api_key,
+            method="GET",
+            path="/catchAll/jobs/user",
+        )
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return f"Error: {str(e)}"
+    except Exception as e:
+        return f"Unexpected error: {str(e)}"
+
+
+@mcp.tool()
+async def continue_job(api_key: str, job_id: str) -> str:
+    """
+    Continue processing a job that needs more data.
+
+    Use this when a job requires additional article fetching.
+
+    Args:
+        api_key: Your Newscatcher API key
+        job_id: The job ID to continue processing
+
+    Returns:
+        JSON confirming the job continuation
+    """
+    try:
+        result = await make_api_request(
+            api_key=api_key,
+            method="POST",
+            path="/catchAll/continue",
+            json_data={"job_id": job_id},
+        )
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return f"Error: {str(e)}"
+    except Exception as e:
+        return f"Unexpected error: {str(e)}"
+
 
 if __name__ == "__main__":
     mcp.run()
