@@ -2,20 +2,51 @@
 MCP Server for Newscatcher CatchAll API
 
 This server provides tools to interact with the Newscatcher CatchAll API.
-Users can provide their API key via:
-1. The api_key parameter in each tool call
-2. The NEWSCATCHER_API_KEY environment variable
+Users can provide their API key via (in order of precedence):
+1. URL query parameter: ?apiKey=YOUR_KEY (recommended for Claude Web)
+2. The api_key parameter in each tool call
+3. The NEWSCATCHER_API_KEY environment variable
 """
 
+import contextvars
 import json
 import os
 from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+from fastmcp.server.dependencies import get_http_request
+
+# Context variable to store the API key from URL for the current session
+session_api_key: contextvars.ContextVar[str] = contextvars.ContextVar("session_api_key", default="")
 
 # API Configuration
 API_BASE_URL = "https://catchall.newscatcherapi.com"
+
+
+class ApiKeyMiddleware(Middleware):
+    """Middleware to extract API key from URL query parameters.
+
+    This allows users to pass their API key once in the connection URL:
+    https://your-server.fastmcp.app/mcp?apiKey=YOUR_KEY
+
+    The key is then used for all subsequent tool calls without
+    needing to pass it in every request.
+    """
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        """Extract API key from HTTP request query params before tool execution."""
+        try:
+            request = get_http_request()
+            api_key = request.query_params.get("apiKey", "")
+            if api_key:
+                session_api_key.set(api_key)
+        except Exception:
+            # Not running in HTTP context (e.g., stdio), skip
+            pass
+        return await call_next(context)
+
 
 # Create the FastMCP server
 mcp = FastMCP(
@@ -24,26 +55,44 @@ mcp = FastMCP(
 
 IMPORTANT: You need a Newscatcher API key to use these tools. Get one at https://www.newscatcherapi.com/
 
-The API key can be provided in two ways:
-1. Pass it directly in the api_key parameter (takes precedence)
-2. Set the NEWSCATCHER_API_KEY environment variable
-
 Workflow:
 1. Use submit_query to submit your news search query
 2. Use get_job_status to check if processing is complete
 3. Use pull_results to retrieve the clustered news articles""",
 )
 
+# Add middleware to extract API key from URL query parameters
+mcp.add_middleware(ApiKeyMiddleware())
+
 
 def get_api_key(api_key: str = "") -> str:
-    """Get API key from parameter or environment variable."""
-    key = api_key or os.environ.get("NEWSCATCHER_API_KEY", "")
-    if not key:
-        raise ValueError(
-            "API key is required. Either pass it as the api_key parameter "
-            "or set the NEWSCATCHER_API_KEY environment variable."
-        )
-    return key
+    """Get API key from parameter, URL session, or environment variable.
+
+    Priority order:
+    1. api_key parameter (explicit in tool call)
+    2. session_api_key (from URL query param ?apiKey=XXX)
+    3. NEWSCATCHER_API_KEY environment variable
+    """
+    # Check explicit parameter first
+    if api_key:
+        return api_key
+
+    # Check session key from URL
+    url_key = session_api_key.get("")
+    if url_key:
+        return url_key
+
+    # Fall back to environment variable
+    env_key = os.environ.get("NEWSCATCHER_API_KEY", "")
+    if env_key:
+        return env_key
+
+    raise ValueError(
+        "API key is required. Provide it via: "
+        "1) URL parameter ?apiKey=YOUR_KEY, "
+        "2) api_key tool parameter, or "
+        "3) NEWSCATCHER_API_KEY environment variable."
+    )
 
 
 async def make_api_request(
